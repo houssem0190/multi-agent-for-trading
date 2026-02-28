@@ -1,7 +1,10 @@
 # Multi-Agent Trading System
 
-A multi-agent trading workflow using LangGraph + Gemini + market data APIs.
-
+This project uses a directed graph (LangGraph) to orchestrate a team of specialized AI agents:
+1. **The Technical Analyst:** Uses `yfinance` and `pandas_ta` to calculate Point-in-Time (PiT) indicators like RSI, MACD, and SMAs for a basket of stocks.
+2. **The Risk Manager:** Evaluates the technical data to determine the current market regime (BULLISH vs. BEARISH).
+3. **The Quantitative Analyst:** If the regime is Bullish, this agent executes a **Graphical Lasso (GLASSO)** algorithm to calculate the Global Minimum Variance portfolio weights using a 1-year historical covariance matrix.
+4. **The Head Trader:** Synthesizes the regime and the mathematical weights to output a final trading execution strategy.
 ## Features
 - Fundamental analysis (Finnhub)
 - Technical analysis (yfinance + pandas-ta)
@@ -13,7 +16,7 @@ A multi-agent trading workflow using LangGraph + Gemini + market data APIs.
 - Python
 - LangGraph
 - LangChain
-- Google Gemini (`gemini-1.5-flash`)
+- Ollama (phi3)
 - Finnhub API
 - yfinance
 - scikit-learn
