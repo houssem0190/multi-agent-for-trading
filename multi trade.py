@@ -116,11 +116,20 @@ def calculate_markowitz(tickers: list[str], target_date: str) -> str:
         ones = np.ones(len(tickers))
         raw_weights = precision_matrix.dot(ones) / ones.dot(precision_matrix).dot(ones)
 
-        weight_dict = dict(zip(tickers, raw_weights))
+        # Clip negatives (negative GLASSO weights have no clean long-only interpretation)
+        # and normalize so weights always sum to exactly 1.0
+        clipped = np.clip(raw_weights, 0, None)
+        total = clipped.sum()
+        if total <= 0:
+            clipped = np.ones(len(tickers))  # fallback: equal weight
+            total = clipped.sum()
+        normalized_weights = clipped / total
+
+        weight_dict = dict(zip(tickers, normalized_weights))
         report = f"GLASSO-Optimized Weights as of {target_date} (alpha=0.6):\n"
         for ticker, weight in weight_dict.items():
             report += f"- {ticker}: {weight * 100:.2f}%\n"
-            
+
         return report
     except Exception as e:
         return f"GLASSO Optimization failed: {str(e)}"
@@ -180,17 +189,33 @@ def sentiment(state: InitialState):
         return {"sentiment_analysis": "\n".join(reports)}
 
 def risk(state: InitialState):
-    message = f"""You are a risk analyst on {state['target_date']}. Review these reports for {state['tickers']}:
-    Fundamentals: {state.get('fundamental_analysis')}
-    Technicals: {state.get('technical_analysis')}
-    Sentiment: {state.get('sentiment_analysis')}
-    If the overall consensus is clearly negative/bearish, output EXACTLY the word "BEARISH".
-    Otherwise, if it is neutral or positive, output EXACTLY the word "BULLISH"."""
-    
-    response = llm.invoke(message)
-    raw_direction = response.content.strip().upper()
-    direction = "BEARISH" if "BEARISH" in raw_direction else "BULLISH"
-    return {"market_direction": direction}  
+    # Use a structured chat message list so the system prompt is respected by Ollama
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a neutral risk analyst. You must respond with exactly ONE word: "
+                "either BULLISH or BEARISH. Do not add any explanation, punctuation, or other text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Today is {state['target_date']}. Based on the three reports below, "
+                f"is the overall market outlook for {state['tickers']} more BULLISH or BEARISH?\n\n"
+                f"--- Fundamentals ---\n{state.get('fundamental_analysis', 'N/A')}\n\n"
+                f"--- Technicals ---\n{state.get('technical_analysis', 'N/A')}\n\n"
+                f"--- Sentiment ---\n{state.get('sentiment_analysis', 'N/A')}\n\n"
+                "Respond with exactly one word: BULLISH or BEARISH."
+            ),
+        },
+    ]
+
+    response = llm.invoke(messages)
+    # Extract only the last word to avoid "NOT BEARISH" false positives
+    raw_direction = response.content.strip().upper().split()[-1]
+    direction = "BEARISH" if raw_direction == "BEARISH" else "BULLISH"
+    return {"market_direction": direction}
 
 def route_market_direction(state: InitialState) -> str:
     if state.get("market_direction") == "BEARISH":
@@ -221,12 +246,27 @@ def trader_node(state: InitialState):
     return {"final_decision": response.content}
 
 def short_trader_node(state: InitialState):
-    prompt = f"""You are a head trader on {state['target_date']}. Review these reports and make a final SHORT decision:
+    """
+    BEARISH regime → defensive rotation, NOT blanket shorting.
+    Strategy:
+      - 40% into GLD  (gold, safe haven)
+      - 30% into TLT  (long-term treasuries, flight-to-safety)
+      - 20% into XOM  (energy / commodities, inflation hedge)
+      - 10% cash-like (SHV: short-term treasuries, near-zero vol)
+    Only the equity tickers get a small tactical short (max 20% of portfolio,
+    volatility-scaled) to express the bearish view without blowing up.
+    """
+    prompt = f"""You are a head trader on {state['target_date']}. The market regime is BEARISH.
+    Do NOT recommend shorting every stock. Instead, recommend a defensive rotation:
+    reduce equity exposure, rotate into bonds (TLT), gold (GLD), and cash equivalents.
+    Only consider a small, volatility-scaled short position on the weakest equity names.
     Fundamentals: {state.get('fundamental_analysis')}
-    Technicals: {state.get('technical_analysis')}
-    Sentiment: {state.get('sentiment_analysis')}"""
+    Technicals:   {state.get('technical_analysis')}
+    Sentiment:    {state.get('sentiment_analysis')}
+    Explain which assets to rotate into and why."""
     response = llm.invoke(prompt)
-    return {"final_decision": f"[SHORT STRATEGY TRIGGERED]\n{response.content}"}
+    return {"final_decision": f"[DEFENSIVE ROTATION TRIGGERED]\n{response.content}"}
+
 
 # ---------------------------------------------------------
 # 6. BUILD AND COMPILE THE GRAPH
@@ -242,7 +282,7 @@ graph.add_node("trader", trader_node)
 graph.add_node("short_trader", short_trader_node)
 
 graph.add_edge(START, "fundamental_analysis")
-graph.add_edge(START, "technical_analysis")    
+graph.add_edge(START, "technical_analysis")
 graph.add_edge(START, "sentiment_analysis")
 graph.add_edge(['fundamental_analysis', 'technical_analysis', 'sentiment_analysis'], 'risk_analysis')
 graph.add_conditional_edges('risk_analysis', route_market_direction, {'short': 'short_trader', 'long': 'markowitz'})
@@ -253,58 +293,214 @@ graph.add_edge("short_trader", END)
 app = graph.compile()
 
 # ---------------------------------------------------------
-# 7. RUN / TEST THE CODE
+# 7. PORTFOLIO HELPERS
+# ---------------------------------------------------------
+
+# Defensive allocation used in BEARISH regime
+# These are real, liquid ETFs that preserve / grow capital in downturns
+DEFENSIVE_PORTFOLIO: dict[str, float] = {
+    "GLD":  0.40,   # Gold — classic flight-to-safety
+    "TLT":  0.30,   # 20yr Treasury bonds — rally when equities fall
+    "XOM":  0.20,   # Energy / commodities — inflation hedge
+    "SHV":  0.10,   # Short-term T-bills — near-zero vol cash proxy
+}
+
+# Max fraction of portfolio allocated to tactical equity shorts in bearish regime
+MAX_SHORT_EXPOSURE = 0.20  # 20% of portfolio at most
+
+
+def _vol_scaled_short_weights(tickers: list[str], date: str, budget: float) -> dict[str, float]:
+    """
+    For each equity ticker, compute an inverse-volatility short weight.
+    Lower vol → smaller short (we don't want to short low-vol names hard).
+    Higher vol → bigger short capped so total <= budget.
+    Returns weight dict (values are fractions of total portfolio).
+    """
+    end   = datetime.datetime.strptime(date, "%Y-%m-%d")
+    start = end - relativedelta(months=3)
+    vols  = {}
+    for t in tickers:
+        try:
+            px = yf.download(t, start=start.strftime("%Y-%m-%d"),
+                             end=end.strftime("%Y-%m-%d"), progress=False)["Close"]
+            if len(px) > 5:
+                vols[t] = float(px.pct_change().dropna().std())
+        except Exception:
+            pass
+
+    if not vols:
+        return {}
+
+    # Inverse-vol: higher vol ↔ less capital at risk (position size shrinks)
+    inv_vol = {t: 1.0 / v for t, v in vols.items()}
+    total   = sum(inv_vol.values())
+    return {t: (w / total) * budget for t, w in inv_vol.items()}
+
+
+# ---------------------------------------------------------
+# 8. RUN / TEST THE CODE
 # ---------------------------------------------------------
 if __name__ == "__main__":
+    import re
     print("🚀 Starting Local LLM Historical Backtest...")
-    
-    tickers_to_test = ["AAPL", "MSFT", "NVDA"]
-    starting_capital = 10000.0
-    current_capital = starting_capital
-    
-    # Test a sequence of months 
-    backtest_dates = ["2023-08-01", "2023-09-01", "2023-10-01"]
-    
-    for date in backtest_dates:
-        print(f"\n{'='*60}\n📅 BACKTEST DATE: {date}\n{'='*60}")
-        
-        inputs = {
-            "tickers": tickers_to_test,
-            "target_date": date
-        }
-        
-        final_state = app.invoke(inputs)
-        
-        regime = final_state.get('market_direction')
-        print(f"\n🏆 Final Decision ({date})")
-        print(f"Detected Regime: {regime}")
-        print("-" * 40)
-        
-        # PnL Calculation
-        try:
-            next_month_obj = datetime.datetime.strptime(date, "%Y-%m-%d") + relativedelta(months=1)
-            next_month_str = next_month_obj.strftime("%Y-%m-%d")
-            
-            proxy_data = yf.download("QQQ", start=date, end=next_month_str)['Close']
-            
-            if not proxy_data.empty:
-                start_price = float(proxy_data.iloc[0].squeeze())
-                end_price = float(proxy_data.iloc[-1].squeeze())
-                
-                month_return = (end_price - start_price) / start_price
-                
-                if regime == "BEARISH":
-                    month_return = -month_return 
-                    
-                monthly_pnl = current_capital * month_return
-                current_capital += monthly_pnl
-                
-                print(f"📈 Simulated Monthly Return: {month_return*100:.2f}%")
-                print(f"💰 Portfolio Value: ${current_capital:.2f}")
-            else:
-                print("⚠️ Could not fetch market proxy data for this month.")
-        except Exception as e:
-            print(f"Could not calculate PnL for {date}: {e}")
 
+    tickers_to_test = [
+        "AAPL",   # Apple
+        "MSFT",   # Microsoft
+        "NVDA",   # Nvidia
+        "GOOGL",  # Alphabet
+        "AMZN",   # Amazon
+        "META",   # Meta
+        "TSLA",   # Tesla
+        "JPM",    # JPMorgan (financials)
+        "XOM",    # Exxon (energy)
+        "GLD",    # Gold ETF (safe haven)
+    ]
+
+    starting_capital = 10_000.0
+    current_capital  = starting_capital
+    backtest_dates   = ["2023-05-01", "2023-09-01", "2023-12-01", "2024-03-01"]
+    trade_log        = []
+
+    for date in backtest_dates:
+        print(f"\n{'='*65}\n📅 BACKTEST DATE: {date}\n{'='*65}")
+
+        inputs     = {"tickers": tickers_to_test, "target_date": date}
+        final_state = app.invoke(inputs)
+
+        regime         = final_state.get("market_direction", "BULLISH")
+        final_decision = final_state.get("final_decision", "")
+        weights_raw    = final_state.get("optimal_weights", "")
+
+        print(f"\n🤖 AI Rationale:\n{'-'*50}\n{final_decision}\n{'-'*50}")
+        print(f"📊 Regime: {regime}")
+
+        # Parse Markowitz weights (lines like "- AAPL: 18.34%")
+        parsed_weights: dict[str, float] = {}
+        for line in weights_raw.splitlines():
+            m = re.search(r"([A-Z]+):\s*([-\d.]+)%", line)
+            if m:
+                parsed_weights[m.group(1)] = float(m.group(2)) / 100.0
+
+        next_month_str = (
+            datetime.datetime.strptime(date, "%Y-%m-%d") + relativedelta(months=1)
+        ).strftime("%Y-%m-%d")
+
+        # ── Build the actual trade book ───────────────────────────────────────
+        # trade_book: {ticker: (action, weight, note)}
+        trade_book: dict[str, tuple[str, float, str]] = {}
+
+        if regime == "BULLISH":
+            # Long-only, Markowitz-weighted (fallback: equal weight)
+            eq_w = 1.0 / len(tickers_to_test)
+            for t in tickers_to_test:
+                w = parsed_weights.get(t, eq_w)
+                trade_book[t] = ("LONG", w, "Markowitz" if t in parsed_weights else "EqWt")
+
+        else:  # BEARISH → defensive rotation + small vol-scaled equity shorts
+            # 1. Defensive ETF allocation (80% of portfolio)
+            for etf, w in DEFENSIVE_PORTFOLIO.items():
+                trade_book[etf] = ("LONG", w, "Defensive")
+
+            # 2. Small tactical shorts on equity tickers (max 20%)
+            short_weights = _vol_scaled_short_weights(
+                tickers_to_test, date, MAX_SHORT_EXPOSURE
+            )
+            for t, w in short_weights.items():
+                if t not in trade_book:   # don't short something already held long
+                    trade_book[t] = ("SHORT", w, "VolScaled")
+
+        # ── Execute & price each position ─────────────────────────────────────
+        print(f"\n{'Ticker':<7} {'Action':<6} {'Alloc':>6} {'Note':<12} "
+              f"{'Buy @':>8} {'Sell @':>8} {'Ret%':>7} {'PnL $':>9}")
+        print("-" * 72)
+
+        month_rows = []
+        for ticker, (action, weight, note) in sorted(trade_book.items()):
+            try:
+                px = yf.download(
+                    ticker, start=date, end=next_month_str, progress=False
+                )["Close"]
+                if px.empty or len(px) < 2:
+                    print(f"{ticker:<7} {'⚠️  no data':}")
+                    continue
+
+                buy_px   = float(px.iloc[0].squeeze())
+                sell_px  = float(px.iloc[-1].squeeze())
+                raw_ret  = (sell_px - buy_px) / buy_px
+
+                # For SHORT positions profit = price going DOWN
+                actual_ret = -raw_ret if action == "SHORT" else raw_ret
+
+                # Hard stop-loss: cap loss at -8% per position
+                actual_ret = max(actual_ret, -0.08)
+
+                allocated = current_capital * weight
+                pnl       = allocated * actual_ret
+                arrow     = "📈" if actual_ret > 0 else "📉"
+
+                print(f"{ticker:<7} {action:<6} {weight*100:>5.1f}%  {note:<12}"
+                      f" {buy_px:>8.2f} {sell_px:>8.2f}"
+                      f" {actual_ret*100:>+6.2f}% {arrow} {pnl:>+8.2f}")
+
+                month_rows.append({
+                    "date": date, "ticker": ticker, "action": action,
+                    "note": note, "weight": weight,
+                    "buy_price": buy_px, "sell_price": sell_px,
+                    "return_pct": actual_ret * 100, "pnl": pnl,
+                })
+
+            except Exception as e:
+                print(f"{ticker:<7} ⚠️  {e}")
+
+        # ── Month roll-up ──────────────────────────────────────────────────────
+        if month_rows:
+            gross_weights = sum(r["weight"] for r in month_rows)
+            total_pnl     = sum(r["pnl"] for r in month_rows)
+            prev_capital  = current_capital
+            current_capital += total_pnl
+            month_ret_pct = (total_pnl / prev_capital) * 100
+
+            print("-" * 72)
+            print(f"{'TOTAL':<7} {'':6} {gross_weights*100:>5.1f}%  {'':12}"
+                  f" {'':>8} {'':>8} {month_ret_pct:>+6.2f}%   {total_pnl:>+8.2f}")
+            print(f"\n💰 Portfolio after {date}: ${current_capital:,.2f}  "
+                  f"({'▲' if total_pnl >= 0 else '▼'} ${abs(total_pnl):,.2f})")
+            trade_log.extend(month_rows)
+
+    # ── Final summary ──────────────────────────────────────────────────────────
     total_return = ((current_capital - starting_capital) / starting_capital) * 100
-    print(f"\n🏁 BACKTEST COMPLETE. Total Return: {total_return:.2f}%")
+    total_pnl    = current_capital - starting_capital
+
+    print(f"\n{'='*65}")
+    print(f"🏁 BACKTEST COMPLETE")
+    print(f"   Starting Capital : ${starting_capital:>10,.2f}")
+    print(f"   Ending Capital   : ${current_capital:>10,.2f}")
+    print(f"   Total P&L        : ${total_pnl:>+10,.2f}")
+    print(f"   Total Return     : {total_return:>+.2f}%")
+    print(f"{'='*65}")
+
+    if trade_log:
+        best  = max(trade_log, key=lambda x: x["pnl"])
+        worst = min(trade_log, key=lambda x: x["pnl"])
+        print(f"\n🥇 Best Trade  : {best['ticker']} on {best['date']}"
+              f" ({best['action']}) → {best['return_pct']:+.2f}%  ${best['pnl']:+,.2f}")
+        print(f"💀 Worst Trade : {worst['ticker']} on {worst['date']}"
+              f" ({worst['action']}) → {worst['return_pct']:+.2f}%  ${worst['pnl']:+,.2f}")
+
+        # ── Per-regime breakdown ───────────────────────────────────────────────
+        bullish_rows  = [r for r in trade_log if r["action"] == "LONG"  and r["note"] != "Defensive"]
+        defensive_rows = [r for r in trade_log if r["note"] == "Defensive"]
+        short_rows    = [r for r in trade_log if r["action"] == "SHORT"]
+
+        def _summarise(rows: list, label: str):
+            if not rows:
+                return
+            total = sum(r["pnl"] for r in rows)
+            avg   = sum(r["return_pct"] for r in rows) / len(rows)
+            print(f"   {label:<28}: {len(rows):>3} trades | avg ret {avg:>+.2f}% | PnL ${total:>+,.2f}")
+
+        print(f"\n📋 Strategy Breakdown:")
+        _summarise(bullish_rows,   "LONG (Markowitz, bullish)")
+        _summarise(defensive_rows, "LONG (Defensive rotation)")
+        _summarise(short_rows,     "SHORT (Vol-scaled, bearish)")
